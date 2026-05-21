@@ -69,6 +69,8 @@ class SqliteDb(BaseDb):
         schedule_runs_table: Optional[str] = None,
         approvals_table: Optional[str] = None,
         auth_tokens_table: Optional[str] = None,
+        store_auth_tokens: bool = False,
+        encrypt_auth_tokens: bool = True,
         id: Optional[str] = None,
     ):
         """
@@ -128,6 +130,8 @@ class SqliteDb(BaseDb):
             schedule_runs_table=schedule_runs_table,
             approvals_table=approvals_table,
             auth_tokens_table=auth_tokens_table,
+            store_auth_tokens=store_auth_tokens,
+            encrypt_auth_tokens=encrypt_auth_tokens,
         )
 
         _engine: Optional[Engine] = db_engine
@@ -230,7 +234,6 @@ class SqliteDb(BaseDb):
             (self.schedule_runs_table_name, "schedule_runs"),
             (self.approvals_table_name, "approvals"),
         ]
-        # auth_tokens is opt-in via store_token_in_db=True — created lazily on first write
 
         for table_name, table_type in tables_to_create:
             self._get_or_create_table(table_name=table_name, table_type=table_type, create_table_if_not_found=True)
@@ -2514,13 +2517,17 @@ class SqliteDb(BaseDb):
                             (new_level > existing_level, insert_stmt.excluded.name),
                             else_=table.c.name,
                         ),
-                        # Preserve existing non-null context values using COALESCE
-                        "run_id": func.coalesce(insert_stmt.excluded.run_id, table.c.run_id),
-                        "session_id": func.coalesce(insert_stmt.excluded.session_id, table.c.session_id),
-                        "user_id": func.coalesce(insert_stmt.excluded.user_id, table.c.user_id),
-                        "agent_id": func.coalesce(insert_stmt.excluded.agent_id, table.c.agent_id),
-                        "team_id": func.coalesce(insert_stmt.excluded.team_id, table.c.team_id),
-                        "workflow_id": func.coalesce(insert_stmt.excluded.workflow_id, table.c.workflow_id),
+                        # Preserve existing non-null context values: COALESCE returns
+                        # the first non-null arg, so put the existing column first.
+                        # Otherwise a later upsert from a child span (e.g. a post-hook
+                        # agent's run with a different session_id) would overwrite
+                        # the trace's already-correct context.
+                        "run_id": func.coalesce(table.c.run_id, insert_stmt.excluded.run_id),
+                        "session_id": func.coalesce(table.c.session_id, insert_stmt.excluded.session_id),
+                        "user_id": func.coalesce(table.c.user_id, insert_stmt.excluded.user_id),
+                        "agent_id": func.coalesce(table.c.agent_id, insert_stmt.excluded.agent_id),
+                        "team_id": func.coalesce(table.c.team_id, insert_stmt.excluded.team_id),
+                        "workflow_id": func.coalesce(table.c.workflow_id, insert_stmt.excluded.workflow_id),
                     },
                 )
                 sess.execute(upsert_stmt)
@@ -2534,18 +2541,17 @@ class SqliteDb(BaseDb):
         trace_id: Optional[str] = None,
         run_id: Optional[str] = None,
     ):
-        """Get a single trace by trace_id or other filters.
+        """Get a single trace by trace_id (or run_id).
+
+        See ``BaseDb.get_trace`` for why no other filters are accepted here.
+        Ownership checks live at the route layer.
 
         Args:
             trace_id: The unique trace identifier.
-            run_id: Filter by run ID (returns first match).
+            run_id: Fallback unique-alternative-key lookup.
 
         Returns:
             Optional[Trace]: The trace if found, None otherwise.
-
-        Note:
-            If multiple filters are provided, trace_id takes precedence.
-            For other filters, the most recent trace is returned.
         """
         try:
             from agno.tracing.schemas import Trace
@@ -4839,6 +4845,17 @@ class SqliteDb(BaseDb):
         return f"{provider}:{user_id or ''}:{service}"
 
     def get_auth_token(self, provider: str, user_id: Optional[str], service: str) -> Optional[Dict[str, Any]]:
+        """
+        Get an OAuth token from the database.
+
+        Args:
+            provider: OAuth provider name (e.g., "google")
+            user_id: User identifier, or None for single-user mode
+            service: Service name (e.g., "gmail", "calendar")
+
+        Returns:
+            Token dict with decrypted token_data, or None if not found.
+        """
         try:
             table = self._get_table(table_type="auth_tokens")
             if table is None:
@@ -4856,6 +4873,18 @@ class SqliteDb(BaseDb):
             return None
 
     def upsert_auth_token(self, token: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Insert or update an OAuth token.
+
+        Args:
+            token: Dict with provider, user_id, service, token_data, granted_scopes.
+
+        Returns:
+            The stored token dict.
+
+        Raises:
+            RuntimeError: If table creation fails.
+        """
         try:
             self._validate_auth_token_payload(token)
             table = self._get_table(table_type="auth_tokens", create_table_if_not_found=True)
@@ -4869,14 +4898,16 @@ class SqliteDb(BaseDb):
             data["updated_at"] = now
             with self.Session() as sess, sess.begin():
                 stmt = sqlite.insert(table).values(**data)
-                stmt = stmt.on_conflict_do_update(
-                    index_elements=["id"],
-                    set_={
-                        "token_data": stmt.excluded.token_data,
-                        "granted_scopes": stmt.excluded.granted_scopes,
-                        "updated_at": stmt.excluded.updated_at,
-                    },
-                )
+                set_dict: Dict[str, Any] = {
+                    "token_data": stmt.excluded.token_data,
+                    "granted_scopes": stmt.excluded.granted_scopes,
+                    "updated_at": stmt.excluded.updated_at,
+                }
+                if "pkce_verifier" in token:
+                    set_dict["pkce_verifier"] = stmt.excluded.pkce_verifier
+                    set_dict["pkce_state_id"] = stmt.excluded.pkce_state_id
+                    set_dict["pkce_expires_at"] = stmt.excluded.pkce_expires_at
+                stmt = stmt.on_conflict_do_update(index_elements=["id"], set_=set_dict)
                 sess.execute(stmt)
             return data
         except Exception as e:
@@ -4884,6 +4915,17 @@ class SqliteDb(BaseDb):
             raise
 
     def delete_auth_token(self, provider: str, user_id: Optional[str], service: str) -> bool:
+        """
+        Delete an OAuth token from the database.
+
+        Args:
+            provider: OAuth provider name (e.g., "google")
+            user_id: User identifier, or None for single-user mode
+            service: Service name (e.g., "gmail", "calendar")
+
+        Returns:
+            True if a token was deleted, False otherwise.
+        """
         try:
             table = self._get_table(table_type="auth_tokens")
             if table is None:
@@ -4894,4 +4936,66 @@ class SqliteDb(BaseDb):
                 return result.rowcount > 0
         except Exception as e:
             log_debug(f"Error deleting auth token: {e}")
+            return False
+
+    def set_pkce_state(
+        self,
+        provider: str,
+        user_id: Optional[str],
+        service: str,
+        verifier: str,
+        state_id: str,
+        expires_at: int,
+        scopes: Optional[list] = None,
+    ) -> bool:
+        """
+        Store PKCE state for an in-progress OAuth flow.
+
+        Args:
+            provider: OAuth provider name (e.g., "google")
+            user_id: User identifier, or None for single-user mode
+            service: Service name (e.g., "gmail", "calendar")
+            verifier: PKCE code verifier
+            state_id: State parameter for callback validation
+            expires_at: Unix timestamp when this PKCE state expires
+            scopes: Requested OAuth scopes
+
+        Returns:
+            True if state was stored successfully.
+        """
+        try:
+            table = self._get_table(table_type="auth_tokens", create_table_if_not_found=True)
+            if table is None:
+                return False
+            token_id = self._auth_token_id(provider, user_id, service)
+            now = int(time.time())
+            data: dict[str, Any] = {
+                "id": token_id,
+                "provider": provider,
+                "user_id": user_id,
+                "service": service,
+                "token_data": {},
+                "granted_scopes": scopes,
+                "pkce_verifier": verifier,
+                "pkce_state_id": state_id,
+                "pkce_expires_at": expires_at,
+                "created_at": now,
+                "updated_at": now,
+            }
+            with self.Session() as sess, sess.begin():
+                stmt = sqlite.insert(table).values(**data)
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=["id"],
+                    set_={
+                        "pkce_verifier": stmt.excluded.pkce_verifier,
+                        "pkce_state_id": stmt.excluded.pkce_state_id,
+                        "pkce_expires_at": stmt.excluded.pkce_expires_at,
+                        "granted_scopes": stmt.excluded.granted_scopes,
+                        "updated_at": stmt.excluded.updated_at,
+                    },
+                )
+                sess.execute(stmt)
+            return True
+        except Exception as e:
+            log_error(f"Error setting PKCE state: {e}")
             return False

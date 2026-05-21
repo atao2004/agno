@@ -9,10 +9,10 @@ from functools import wraps
 from typing import Any, Dict, List, Optional
 
 from agno.utils.log import log_debug, log_error, log_info, log_warning
-from agno.utils.oauth_state import decode_state_insecure, verify_state
+from agno.utils.oauth_state import verify_state
 
 
-def _generate_pkce_pair() -> tuple[str, str]:
+def generate_pkce_pair() -> tuple[str, str]:
     """Generate PKCE code_verifier and code_challenge (S256).
 
     Returns:
@@ -156,6 +156,9 @@ def _persist_google_token(
                 "service": "google",
                 "token_data": token_data,
                 "granted_scopes": granted_scopes,
+                "pkce_verifier": None,
+                "pkce_state_id": None,
+                "pkce_expires_at": None,
             }
         )
         return True
@@ -176,7 +179,14 @@ def _valid_auth_token_db(db: Any) -> Any:
     if db is None:
         return None
 
-    from agno.db.base import BaseDb
+    from agno.db.base import AsyncBaseDb, BaseDb
+
+    if isinstance(db, AsyncBaseDb):
+        log_warning(
+            "Async database detected but Google OAuth requires sync DB for token storage. "
+            "Token persistence will be disabled. Use a sync DB (e.g., SqliteDb, PgDb) for multi-user OAuth."
+        )
+        return None
 
     if isinstance(db, BaseDb) and type(db).get_auth_token is not BaseDb.get_auth_token:
         return db
@@ -186,15 +196,15 @@ def _valid_auth_token_db(db: Any) -> Any:
 def get_token_db(toolkit: Any, agent: Optional[Any] = None) -> Any:
     """Resolve the DB to use for token storage. Returns None if no DB available.
 
-    Priority: agent.db (framework-injected) > explicit db on oauth_config/toolkit.
+    Priority: agent.db (framework-injected) > explicit db on auth_config/toolkit.
     """
     # Primary: agent.db (the modern pattern)
     agent_db = _valid_auth_token_db(getattr(agent, "db", None))
     if agent_db:
         return agent_db
 
-    # Fallback: explicit db on oauth_config (legacy)
-    ga = getattr(toolkit, "oauth_config", None)
+    # Fallback: explicit db on auth_config (legacy)
+    ga = getattr(toolkit, "auth_config", None)
     if ga is not None:
         explicit_db = _valid_auth_token_db(getattr(ga, "_db", None))
         if explicit_db:
@@ -277,7 +287,7 @@ def save_token(
     agent: Optional[Any] = None,
 ) -> bool:
     """Persist credentials to DB. Returns True on success."""
-    ga = getattr(toolkit, "oauth_config", None)
+    ga = getattr(toolkit, "auth_config", None)
     return _persist_google_token(
         db=get_token_db(toolkit, agent=agent),
         creds=creds,
@@ -286,7 +296,7 @@ def save_token(
     )
 
 
-class GoogleOAuthConfig:
+class GoogleAuthConfig:
     """OAuth coordinator for Google toolkits — NOT a Toolkit itself.
 
     Handles:
@@ -298,11 +308,11 @@ class GoogleOAuthConfig:
         gmail = GmailTools()
 
     Usage (interface — client-side OAuth, opt-in):
-        oauth_config = GoogleOAuthConfig(hosted_domain="mycompany.com")
+        auth_config = GoogleAuthConfig(hosted_domain="mycompany.com")
         agent = Agent(
             db=db,
             tools=[
-                GoogleOAuthTools(oauth_config=oauth_config),
+                GoogleOAuthTools(auth_config=auth_config),
                 GmailTools(),  # Auto-wired from GoogleOAuthTools
             ],
         )
@@ -324,6 +334,9 @@ class GoogleOAuthConfig:
         login_hint: Optional[str] = None,
         # Route configuration
         callback_path: Optional[str] = None,
+        # Service account authentication (alternative to OAuth)
+        service_account_path: Optional[str] = None,
+        delegated_user: Optional[str] = None,
     ):
         self.client_id = client_id or os.getenv("GOOGLE_CLIENT_ID")
         self.client_secret = client_secret or os.getenv("GOOGLE_CLIENT_SECRET")
@@ -348,6 +361,9 @@ class GoogleOAuthConfig:
         self._callback_path = callback_path or os.getenv("GOOGLE_OAUTH_CALLBACK_PATH", "/google/oauth/callback")
         self._prompt = prompt
         self._login_hint = login_hint
+        # Service account auth (when set, OAuth is skipped)
+        self._service_account_path = service_account_path or os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE")
+        self._delegated_user = delegated_user or os.getenv("GOOGLE_DELEGATED_USER")
 
     def register_service(self, service: str, scopes: List[str]) -> None:
         # Union scopes if service already registered (multiple toolkits, different scopes)
@@ -381,15 +397,14 @@ class GoogleOAuthConfig:
                 "Install with `pip install PyJWT` or `pip install agno[os]`."
             }
 
+        if not self._state_secret:
+            return {
+                "error": "GOOGLE_OAUTH_STATE_SECRET not configured. "
+                "OAuth callback cannot verify state without a signing secret."
+            }
+
         try:
-            if self._state_secret:
-                state_data = verify_state(state, secret=self._state_secret)
-            else:
-                log_warning(
-                    "GOOGLE_OAUTH_STATE_SECRET not set - skipping state verification. "
-                    "This is INSECURE and should only be used in development."
-                )
-                state_data = decode_state_insecure(state)
+            state_data = verify_state(state, secret=self._state_secret)
         except jwt.InvalidTokenError as e:
             log_warning(f"Rejected OAuth callback: {e}")
             return {"error": f"Invalid state: {e}"}
@@ -413,9 +428,10 @@ class GoogleOAuthConfig:
             log_warning(f"No PKCE state found for user={user_id}")
             return {"error": "OAuth session expired or invalid. Please try again."}
 
-        token_data = row.get("token_data", {})
-        stored_state_id = token_data.get("pkce_state_id")
-        code_verifier = token_data.get("pkce_verifier")
+        # Read PKCE from dedicated columns
+        stored_state_id = row.get("pkce_state_id")
+        code_verifier = row.get("pkce_verifier")
+        pkce_expires_at = row.get("pkce_expires_at")
 
         if not stored_state_id or stored_state_id != state_id:
             log_warning(f"PKCE state_id mismatch for user={user_id}: expected {stored_state_id}, got {state_id}")
@@ -424,6 +440,13 @@ class GoogleOAuthConfig:
         if not code_verifier:
             log_warning(f"Missing code_verifier for user={user_id}")
             return {"error": "OAuth session corrupted. Please try again."}
+
+        # Check PKCE expiry
+        import time
+
+        if pkce_expires_at and int(time.time()) > pkce_expires_at:
+            log_warning(f"PKCE state expired for user={user_id}")
+            return {"error": "OAuth session expired. Please try again."}
 
         try:
             from google_auth_oauthlib.flow import Flow
@@ -496,9 +519,9 @@ class GoogleOAuthConfig:
             app.include_router(google_auth.get_oauth_router(db=agent.db))
         """
         if not self._state_secret:
-            log_warning(
-                "GOOGLE_OAUTH_STATE_SECRET not set - OAuth state verification disabled. "
-                "This is INSECURE and should only be used in development."
+            raise RuntimeError(
+                "GOOGLE_OAUTH_STATE_SECRET is required for OAuth callback security. "
+                "Set it via environment variable or GoogleAuthConfig(state_secret=...)."
             )
 
         # Resolve db: explicit param > GoogleAuth(db=...) > fail

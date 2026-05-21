@@ -2,41 +2,15 @@
 
 Agents for Gmail, Google Calendar, Google Drive, and Google Slides using OAuth or service account authentication.
 
-## Authentication Scenarios
-
-The framework supports 5 credential resolution paths. Choose based on your deployment:
-
-| Scenario | Cookbook | Use Case |
-|----------|----------|----------|
-| **Interactive OAuth (file)** | `gmail_tools.py` | Dev/single-user: browser popup, saves `token.json` |
-| **Database + Standalone** | `google_auth_db_storage.py` | Persist tokens across runs without browser each time |
-| **Database + Interface** | `slack/gmail_oauth.py` | Multi-user SaaS: Slack/WhatsApp bots with per-user OAuth |
-| **Service Account** | `google_service_account.py` | Server/enterprise: no browser, domain-wide delegation |
-| **Enterprise OAuth** | `google_enterprise_oauth.py` | Restrict to workspace domain (`hosted_domain`) |
-| **Multi-toolkit Workspace** | `google_workspace_with_db.py` | Gmail + Calendar + Drive with shared auth |
-
-### Quick Decision Guide
-
-```
-Do you need per-user authentication?
-├─ NO (single service account) → google_service_account.py
-└─ YES
-   ├─ Running in Slack/WhatsApp/Web interface? → slack/gmail_oauth.py
-   ├─ Running standalone script?
-   │  ├─ Want to persist tokens in DB? → google_auth_db_storage.py
-   │  └─ OK with token.json file? → gmail_tools.py (default)
-   └─ Need to restrict to company domain? → google_enterprise_oauth.py
-```
-
 ## Quick Start
 
 ```python
 from agno.agent import Agent
-from agno.models.openai import OpenAIChat
+from agno.models.openai import OpenAIResponses
 from agno.tools.google.calendar import GoogleCalendarTools
 
 agent = Agent(
-    model=OpenAIChat(id="gpt-4o"),
+    model=OpenAIResponses(id="gpt-5.4"),
     tools=[GoogleCalendarTools()],
     add_datetime_to_context=True,
     markdown=True,
@@ -45,18 +19,41 @@ agent = Agent(
 agent.print_response("What meetings do I have tomorrow?", stream=True)
 ```
 
+### With DB Token Storage
+
 ```python
 from agno.agent import Agent
-from agno.models.openai import OpenAIChat
-from agno.tools.google.slides import GoogleSlidesTools
+from agno.db.sqlite.sqlite import SqliteDb
+from agno.models.openai import OpenAIResponses
+from agno.tools.google.calendar import GoogleCalendarTools
+from agno.tools.google.gmail import GmailTools
 
 agent = Agent(
-    model=OpenAIChat(id="gpt-4o"),
-    tools=[GoogleSlidesTools()],
-    markdown=True,
+    model=OpenAIResponses(id="gpt-5.4"),
+    db=SqliteDb(db_file="app.db", store_auth_tokens=True),
+    tools=[GmailTools(), GoogleCalendarTools()],
 )
 
-agent.print_response("Create a presentation titled 'Q3 Review'", stream=True)
+agent.print_response("Show my emails and calendar", user_id="user-1")
+```
+
+### With Service Account
+
+```python
+from agno.agent import Agent
+from agno.models.openai import OpenAIResponses
+from agno.tools.google.auth import GoogleAuthConfig
+from agno.tools.google.gmail import GmailTools
+
+auth = GoogleAuthConfig(
+    service_account_path="/path/to/key.json",
+    delegated_user="admin@company.com",
+)
+
+agent = Agent(
+    model=OpenAIResponses(id="gpt-5.4"),
+    tools=[GmailTools(auth_config=auth)],
+)
 ```
 
 ## Setup
@@ -124,12 +121,13 @@ export GOOGLE_DELEGATED_USER=user@yourdomain.com  # required for Gmail, optional
 
 | File | Description |
 |------|-------------|
-| `gmail_tools.py` | Core examples: read-only agent, safe agent, label manager, full agent, thread reply |
+| `gmail_tools.py` | Read-only agent, safe agent, label manager, full agent |
 | `gmail_daily_digest.py` | Structured email digest with priority classification |
 | `gmail_inbox_triage.py` | Personal inbox triage agent with LearningMachine |
 | `gmail_draft_reply.py` | Thread-aware draft replies |
 | `gmail_followup_tracker.py` | Find unanswered sent emails, draft follow-ups |
 | `gmail_action_items.py` | Extract structured action items from email threads |
+| `gmail_with_db.py` | Gmail with DB token storage for multi-user apps |
 
 ### Calendar
 
@@ -147,12 +145,13 @@ export GOOGLE_DELEGATED_USER=user@yourdomain.com  # required for Gmail, optional
 | `drive_file_search.py` | Search files with structured output schema and pagination |
 | `drive_document_reader.py` | Read and summarize Google Docs, Sheets, and Slides as text |
 | `drive_folder_organizer.py` | Browse folder structure, upload local files, and download from Drive |
+| `drive_all_drives_search.py` | Search across personal and shared drives organization-wide |
 
 ### Slides
 
 | File | Description |
 |------|-------------|
-| `slide_tools.py` | Core examples: create presentation, add slides, read content, list, delete |
+| `slide_tools.py` | Create presentation, add slides, read content, list, delete |
 | `slides_presentation_builder.py` | Multi-slide deck builder with tables, layouts, and text annotations |
 | `slides_content_reader.py` | Read and summarize existing presentations with structured output |
 | `slides_media_slides.py` | Background images, YouTube embeds, and Drive video integration |
@@ -163,18 +162,13 @@ export GOOGLE_DELEGATED_USER=user@yourdomain.com  # required for Gmail, optional
 |------|-------------|
 | `docs_tools.py` | Core examples: create document, read text, batch update, append text, export as PDF |
 
-### Combined
+### Combined / Auth
 
 | File | Description |
 |------|-------------|
+| `google_workspace_agent.py` | Gmail + Calendar + Drive with shared OAuth (file storage) |
+| `google_workspace_with_db.py` | Gmail + Calendar + Drive with DB token storage |
+| `google_oauth_server.py` | AgentOS server with auto-mounted OAuth callback |
+| `google_service_account.py` | Service account with domain-wide delegation |
+| `google_enterprise_oauth.py` | OAuth with `hosted_domain` restriction for enterprise |
 | `calendar_gmail_meeting_prep.py` | Calendar + Gmail: meeting prep briefs with attendee email context |
-| `google_workspace_with_db.py` | Gmail + Calendar with DB token storage |
-| `google_workspace_agent.py` | Multi-service agent with all Google tools |
-
-### Authentication
-
-| File | Description |
-|------|-------------|
-| `google_auth_db_storage.py` | Simplified: just `GmailTools()` + `db=SqliteDb()` — zero config |
-| `google_service_account.py` | Service account with domain-wide delegation (enterprise) |
-| `google_enterprise_oauth.py` | OAuth with `hosted_domain` restriction and enterprise features |

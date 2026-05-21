@@ -52,7 +52,8 @@ class BaseDb(ABC):
         schedule_runs_table: Optional[str] = None,
         approvals_table: Optional[str] = None,
         auth_tokens_table: Optional[str] = None,
-        encrypt_auth_tokens: Optional[bool] = None,
+        store_auth_tokens: bool = False,
+        encrypt_auth_tokens: bool = True,
         auth_token_encryption_key: Optional[str] = None,
         id: Optional[str] = None,
     ):
@@ -74,6 +75,7 @@ class BaseDb(ABC):
         self.schedule_runs_table_name = schedule_runs_table or "agno_schedule_runs"
         self.approvals_table_name = approvals_table or "agno_approvals"
         self.auth_tokens_table_name = auth_tokens_table or "agno_auth_tokens"
+        self.store_auth_tokens = store_auth_tokens
         self.encrypt_auth_tokens = encrypt_auth_tokens
         self.auth_token_encryption_key = auth_token_encryption_key
 
@@ -127,7 +129,7 @@ class BaseDb(ABC):
             schedule_runs_table=data.get("schedule_runs_table"),
             approvals_table=data.get("approvals_table"),
             auth_tokens_table=data.get("auth_tokens_table"),
-            encrypt_auth_tokens=data.get("encrypt_auth_tokens"),
+            encrypt_auth_tokens=data.get("encrypt_auth_tokens", True),
             auth_token_encryption_key=data.get("auth_token_encryption_key"),
             id=data.get("id"),
         )
@@ -414,25 +416,22 @@ class BaseDb(ABC):
         self,
         trace_id: Optional[str] = None,
         run_id: Optional[str] = None,
-        session_id: Optional[str] = None,
-        user_id: Optional[str] = None,
-        agent_id: Optional[str] = None,
     ):
-        """Get a single trace by trace_id or other filters.
+        """Get a single trace by trace_id (or run_id).
+
+        A trace_id deterministically identifies one trace, which already
+        belongs to one agent / team / workflow / session / user. Adding any of
+        those as filters would just narrow a unique lookup redundantly — they
+        don't belong here. Ownership / authorization checks live at the route
+        layer (compare ``trace.user_id`` to the caller after fetching).
 
         Args:
             trace_id: The unique trace identifier.
-            run_id: Filter by run ID (returns first match).
-            session_id: Filter by session ID (returns first match).
-            user_id: Filter by user ID (returns first match).
-            agent_id: Filter by agent ID (returns first match).
+            run_id: Fallback lookup when the caller has run_id but not trace_id
+                (one trace per run, so this is also a unique alternative key).
 
         Returns:
             Optional[Trace]: The trace if found, None otherwise.
-
-        Note:
-            If multiple filters are provided, trace_id takes precedence.
-            For other filters, the most recent trace is returned.
         """
         raise NotImplementedError
 
@@ -1126,12 +1125,8 @@ class BaseDb(ABC):
             raise ValueError("Auth token 'token_data' must be a dict")
 
     def _should_encrypt_auth_tokens(self) -> bool:
-        """Check if auth token encryption is enabled (param or env var)."""
-        import os
-
-        if self.encrypt_auth_tokens is not None:
-            return self.encrypt_auth_tokens
-        return os.getenv("AGNO_AUTH_TOKEN_ENCRYPTION", "false").lower() == "true"
+        """Check if auth token encryption is enabled (default: True)."""
+        return self.encrypt_auth_tokens
 
     def _encrypt_token_data(self, token_data: Dict[str, Any]) -> Dict[str, Any]:
         """Encrypt token_data if encryption is enabled."""
@@ -1465,25 +1460,16 @@ class AsyncBaseDb(ABC):
         self,
         trace_id: Optional[str] = None,
         run_id: Optional[str] = None,
-        session_id: Optional[str] = None,
-        user_id: Optional[str] = None,
-        agent_id: Optional[str] = None,
     ):
-        """Get a single trace by trace_id or other filters.
+        """Async variant of ``BaseDb.get_trace`` — see that docstring for the
+        rationale on why no other filters are accepted here.
 
         Args:
             trace_id: The unique trace identifier.
-            run_id: Filter by run ID (returns first match).
-            session_id: Filter by session ID (returns first match).
-            user_id: Filter by user ID (returns first match).
-            agent_id: Filter by agent ID (returns first match).
+            run_id: Fallback unique-alternative-key lookup.
 
         Returns:
             Optional[Trace]: The trace if found, None otherwise.
-
-        Note:
-            If multiple filters are provided, trace_id takes precedence.
-            For other filters, the most recent trace is returned.
         """
         raise NotImplementedError
 
@@ -1874,8 +1860,3 @@ class AsyncBaseDb(ABC):
             Number of approvals updated.
         """
         raise NotImplementedError
-
-    # Async auth-token CRUD is deliberately not part of AsyncBaseDb. All OAuth
-    # token callers (agno.tools.google.auth) invoke these synchronously, so
-    # routing them through an async backend would return unawaited coroutines.
-    # Use sync PostgresDb / SqliteDb for OAuth token storage.

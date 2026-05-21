@@ -887,17 +887,24 @@ class AgentOS:
 
     def _add_jwt_middleware(self, fastapi_app: FastAPI) -> None:
         from agno.os.middleware.jwt import JWTMiddleware, JWTValidator
+        from agno.os.scopes import AgentOSScope
 
         verify_audience = False
         jwks_file = None
         verification_keys = None
         algorithm = "RS256"
+        audience = None
+        admin_scope: Optional[str] = None
+        user_isolation = False
 
         if self.authorization_config:
             algorithm = self.authorization_config.algorithm or "RS256"
             verification_keys = self.authorization_config.verification_keys
             jwks_file = self.authorization_config.jwks_file
             verify_audience = self.authorization_config.verify_audience or False
+            audience = self.authorization_config.audience
+            admin_scope = self.authorization_config.admin_scope
+            user_isolation = self.authorization_config.user_isolation
 
         log_info(f"Adding JWT middleware for authorization (algorithm: {algorithm})")
 
@@ -908,6 +915,15 @@ class AgentOS:
             algorithm=algorithm,
         )
         fastapi_app.state.jwt_validator = jwt_validator
+        # Expose audience config + admin scope on app.state so WebSocket auth
+        # (which does not flow through HTTP middleware) can honour them.
+        fastapi_app.state.jwt_verify_audience = verify_audience
+        fastapi_app.state.jwt_audience = audience
+        fastapi_app.state.admin_scope = admin_scope or AgentOSScope.ADMIN.value
+        # User isolation is opt-in and orthogonal to RBAC. When False (default)
+        # JWT/RBAC still apply but the per-user DB wrapper and ownership gates
+        # added by the user-scoped-DB work stay dormant.
+        fastapi_app.state.user_isolation_enabled = user_isolation
 
         # Collect interface route prefixes to exclude from JWT auth.
         # Interfaces use their own authentication mechanisms
@@ -939,15 +955,23 @@ class AgentOS:
             )
 
         # Add middleware to stack
-        fastapi_app.add_middleware(
-            JWTMiddleware,
-            verification_keys=verification_keys,
-            jwks_file=jwks_file,
-            algorithm=algorithm,
-            authorization=self.authorization,
-            verify_audience=verify_audience,
-            excluded_route_paths=excluded_route_paths,
-        )
+        middleware_kwargs: Dict[str, Any] = {
+            "verification_keys": verification_keys,
+            "jwks_file": jwks_file,
+            "algorithm": algorithm,
+            "authorization": self.authorization,
+            "verify_audience": verify_audience,
+            "excluded_route_paths": excluded_route_paths,
+        }
+        if audience:
+            middleware_kwargs["audience"] = audience
+        if admin_scope:
+            middleware_kwargs["admin_scope"] = admin_scope
+        # Default to False on the middleware; only forward when actually enabled
+        # so manual app.add_middleware(JWTMiddleware) defaults stay backwards-compatible.
+        if user_isolation:
+            middleware_kwargs["user_isolation"] = True
+        fastapi_app.add_middleware(JWTMiddleware, **middleware_kwargs)
 
     def get_routes(self) -> List[Any]:
         """Retrieve all routes from the FastAPI app.
@@ -1034,17 +1058,12 @@ class AgentOS:
         }
 
     def _discover_oauth_routers(self) -> List[APIRouter]:
-        """Find GoogleOAuthTools in agents and return their OAuth callback routers.
-
-        When GoogleOAuthTools is present in an agent's tools, this auto-mounts the
-        /google/oauth/callback endpoint so users don't need to manually call
-        `app.include_router(oauth_config.get_oauth_router(db=db))`.
-        """
+        """Find GoogleOAuthTools in agents and return their OAuth callback routers."""
         routers: List[APIRouter] = []
         seen_configs: set = set()
 
         try:
-            from agno.tools.google.auth import GoogleOAuthConfig
+            from agno.tools.google.auth import GoogleAuthConfig
             from agno.tools.google.oauth_tools import GoogleOAuthTools
         except ImportError:
             return routers
@@ -1057,16 +1076,15 @@ class AgentOS:
                 if not isinstance(tool, GoogleOAuthTools):
                     continue
 
-                oauth_config = getattr(tool, "oauth_config", None)
-                # Auto-create config from env vars if not provided
-                if oauth_config is None:
-                    oauth_config = GoogleOAuthConfig()
-                    tool.oauth_config = oauth_config
+                auth_config = getattr(tool, "auth_config", None)
+                if auth_config is None:
+                    auth_config = GoogleAuthConfig()
+                    tool.auth_config = auth_config
 
                 # Deduplicate by config object identity
-                if id(oauth_config) in seen_configs:
+                if id(auth_config) in seen_configs:
                     continue
-                seen_configs.add(id(oauth_config))
+                seen_configs.add(id(auth_config))
 
                 # Resolve DB: agent.db or AgentOS.db
                 db = agent.db or self.db
@@ -1078,14 +1096,14 @@ class AgentOS:
                     continue
 
                 try:
-                    router = oauth_config.get_oauth_router(db=db)
+                    router = auth_config.get_oauth_router(db=db)
                     routers.append(router)
-                    callback_path = getattr(oauth_config, "_callback_path", "/google/oauth/callback")
+                    callback_path = getattr(auth_config, "_callback_path", "/google/oauth/callback")
                     self._oauth_callback_paths.append(callback_path)
                     log_warning(
                         f"Auto-mounted Google OAuth callback at {callback_path}. "
                         f"Set GOOGLE_REDIRECT_URI to match (e.g., https://your-domain{callback_path}). "
-                        "To customize the path, use GoogleOAuthConfig(callback_path='/your/path')."
+                        "To customize the path, use GoogleAuthConfig(callback_path='/your/path')."
                     )
                 except Exception as e:
                     log_warning(f"Failed to auto-mount OAuth router: {e}")

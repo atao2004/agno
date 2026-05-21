@@ -80,6 +80,8 @@ class PostgresDb(BaseDb):
         schedule_runs_table: Optional[str] = None,
         approvals_table: Optional[str] = None,
         auth_tokens_table: Optional[str] = None,
+        store_auth_tokens: bool = False,
+        encrypt_auth_tokens: bool = True,
         id: Optional[str] = None,
         create_schema: bool = True,
     ):
@@ -157,6 +159,8 @@ class PostgresDb(BaseDb):
             schedule_runs_table=schedule_runs_table,
             approvals_table=approvals_table,
             auth_tokens_table=auth_tokens_table,
+            store_auth_tokens=store_auth_tokens,
+            encrypt_auth_tokens=encrypt_auth_tokens,
         )
 
         self.db_schema: str = db_schema if db_schema is not None else "ai"
@@ -2902,13 +2906,17 @@ class PostgresDb(BaseDb):
                             (new_level > existing_level, insert_stmt.excluded.name),
                             else_=table.c.name,
                         ),
-                        # Preserve existing non-null context values using COALESCE
-                        "run_id": func.coalesce(insert_stmt.excluded.run_id, table.c.run_id),
-                        "session_id": func.coalesce(insert_stmt.excluded.session_id, table.c.session_id),
-                        "user_id": func.coalesce(insert_stmt.excluded.user_id, table.c.user_id),
-                        "agent_id": func.coalesce(insert_stmt.excluded.agent_id, table.c.agent_id),
-                        "team_id": func.coalesce(insert_stmt.excluded.team_id, table.c.team_id),
-                        "workflow_id": func.coalesce(insert_stmt.excluded.workflow_id, table.c.workflow_id),
+                        # Preserve existing non-null context values: COALESCE returns
+                        # the first non-null arg, so put the existing column first.
+                        # Otherwise a later upsert from a child span (e.g. a post-hook
+                        # agent's run with a different session_id) would overwrite
+                        # the trace's already-correct context.
+                        "run_id": func.coalesce(table.c.run_id, insert_stmt.excluded.run_id),
+                        "session_id": func.coalesce(table.c.session_id, insert_stmt.excluded.session_id),
+                        "user_id": func.coalesce(table.c.user_id, insert_stmt.excluded.user_id),
+                        "agent_id": func.coalesce(table.c.agent_id, insert_stmt.excluded.agent_id),
+                        "team_id": func.coalesce(table.c.team_id, insert_stmt.excluded.team_id),
+                        "workflow_id": func.coalesce(table.c.workflow_id, insert_stmt.excluded.workflow_id),
                     },
                 )
                 sess.execute(upsert_stmt)
@@ -5019,14 +5027,16 @@ class PostgresDb(BaseDb):
             data["updated_at"] = now
             with self.Session() as sess, sess.begin():
                 stmt = postgresql.insert(table).values(**data)
-                stmt = stmt.on_conflict_do_update(
-                    index_elements=["id"],
-                    set_={
-                        "token_data": stmt.excluded.token_data,
-                        "granted_scopes": stmt.excluded.granted_scopes,
-                        "updated_at": stmt.excluded.updated_at,
-                    },
-                )
+                set_dict: Dict[str, Any] = {
+                    "token_data": stmt.excluded.token_data,
+                    "granted_scopes": stmt.excluded.granted_scopes,
+                    "updated_at": stmt.excluded.updated_at,
+                }
+                if "pkce_verifier" in token:
+                    set_dict["pkce_verifier"] = stmt.excluded.pkce_verifier
+                    set_dict["pkce_state_id"] = stmt.excluded.pkce_state_id
+                    set_dict["pkce_expires_at"] = stmt.excluded.pkce_expires_at
+                stmt = stmt.on_conflict_do_update(index_elements=["id"], set_=set_dict)
                 sess.execute(stmt)
             return data
         except Exception as e:
@@ -5044,4 +5054,51 @@ class PostgresDb(BaseDb):
                 return result.rowcount > 0
         except Exception as e:
             log_debug(f"Error deleting auth token: {e}")
+            return False
+
+    def set_pkce_state(
+        self,
+        provider: str,
+        user_id: Optional[str],
+        service: str,
+        verifier: str,
+        state_id: str,
+        expires_at: int,
+        scopes: Optional[list] = None,
+    ) -> bool:
+        try:
+            table = self._get_table(table_type="auth_tokens", create_table_if_not_found=True)
+            if table is None:
+                return False
+            token_id = self._auth_token_id(provider, user_id, service)
+            now = int(time.time())
+            data: dict[str, Any] = {
+                "id": token_id,
+                "provider": provider,
+                "user_id": user_id,
+                "service": service,
+                "token_data": {},
+                "granted_scopes": scopes,
+                "pkce_verifier": verifier,
+                "pkce_state_id": state_id,
+                "pkce_expires_at": expires_at,
+                "created_at": now,
+                "updated_at": now,
+            }
+            with self.Session() as sess, sess.begin():
+                stmt = postgresql.insert(table).values(**data)
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=["id"],
+                    set_={
+                        "pkce_verifier": stmt.excluded.pkce_verifier,
+                        "pkce_state_id": stmt.excluded.pkce_state_id,
+                        "pkce_expires_at": stmt.excluded.pkce_expires_at,
+                        "granted_scopes": stmt.excluded.granted_scopes,
+                        "updated_at": stmt.excluded.updated_at,
+                    },
+                )
+                sess.execute(stmt)
+            return True
+        except Exception as e:
+            log_error(f"Error setting PKCE state: {e}")
             return False
